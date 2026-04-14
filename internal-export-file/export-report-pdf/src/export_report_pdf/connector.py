@@ -3,45 +3,245 @@ import datetime
 import io
 import json
 import os
+import re
 import time
 
 import cairosvg
 import cmarkgfm
 from cmarkgfm import Options as cmarkgfmOptions
-from export_report_pdf.config import ConnectorConfig
 from jinja2 import Environment, FileSystemLoader
 from pycti import OpenCTIConnectorHelper, StixCyberObservableTypes
 from pygal_maps_world.i18n import COUNTRIES
 from pygal_maps_world.maps import World
 from weasyprint import HTML
 
+from export_report_pdf.config import ConnectorConfig
+
 CMARKGFM_OPTIONS = (
-    cmarkgfmOptions.CMARK_OPT_GITHUB_PRE_LANG  # Use GitHub-style tags for code blocks
-    | cmarkgfmOptions.CMARK_OPT_FOOTNOTES  # Parse footnotes
-    | cmarkgfmOptions.CMARK_OPT_TABLE_PREFER_STYLE_ATTRIBUTES  # Use style attributes to align table cells
+    cmarkgfmOptions.CMARK_OPT_GITHUB_PRE_LANG
+    | cmarkgfmOptions.CMARK_OPT_FOOTNOTES
+    | cmarkgfmOptions.CMARK_OPT_TABLE_PREFER_STYLE_ATTRIBUTES
 )
+
+# ---------------------------------------------------------------------------
+# Callout block definitions
+# Maps GitHub alert types -> (css_class, display_label)
+# ---------------------------------------------------------------------------
+_CALLOUT_TYPES: dict[str, tuple[str, str]] = {
+    "NOTE": ("callout-note", "Note"),
+    "INFO": ("callout-note", "Info"),
+    "TIP": ("callout-note", "Tip"),
+    "IMPORTANT": ("callout-critical", "Important"),
+    "CRITICAL": ("callout-critical", "Critical Action"),
+    "WARNING": ("callout-warning", "Warning"),
+    "CAUTION": ("callout-warning", "Caution"),
+}
+
+# cmarkgfm renders  > [!TYPE]\n> body  as <blockquote><p>[!TYPE]\nbody</p>…</blockquote>
+_CALLOUT_RE = re.compile(
+    r"<blockquote>\s*<p>\[!([A-Z]+)\]\n?(.*?)</p>(.*?)</blockquote>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Observable types surfaced as "impacted assets" in the dashboard panel
+_ASSET_OBSERVABLE_TYPES = {
+    "IPv4-Addr",
+    "IPv6-Addr",
+    "Domain-Name",
+    "Hostname",
+    "Network-Traffic",
+    "Url",
+}
+
+
+def _replace_callout(match: re.Match) -> str:
+    """Regex replacement: rewrite a callout blockquote as a styled div."""
+    callout_type = match.group(1).upper()
+    first_line = match.group(2).strip()
+    rest_content = match.group(3).strip()
+
+    css_class, label = _CALLOUT_TYPES.get(
+        callout_type, ("callout-note", callout_type.capitalize())
+    )
+
+    body_parts = []
+    if first_line:
+        body_parts.append(f"<p>{first_line}</p>")
+    if rest_content:
+        body_parts.append(rest_content)
+    body_html = "\n".join(body_parts)
+
+    return (
+        f'<div class="{css_class}">'
+        f'<div class="callout-label">{label}</div>'
+        f'<div class="callout-body">{body_html}</div>'
+        f"</div>"
+    )
+
+
+def _process_callouts(html: str) -> str:
+    """
+    Post-process cmarkgfm HTML to convert GitHub-style alert blockquotes
+    (> [!NOTE], > [!WARNING], etc.) into styled callout <div> blocks.
+    Call this after cmarkgfm.github_flavored_markdown_to_html().
+    """
+    return _CALLOUT_RE.sub(_replace_callout, html)
+
+
+def _build_dashboard_context(entities: dict, observables: dict) -> dict:
+    """
+    Compute dashboard summary metrics from already-classified entities/observables.
+    Returns a dict ready to merge into the Jinja2 template context.
+    """
+    total_iocs = sum(len(v) for v in observables.values())
+
+    def _count_entity(key: str) -> int:
+        for k, v in entities.items():
+            if k.lower().replace("-", "_") == key.lower():
+                return len(v)
+        return 0
+
+    impacted_assets: list[str] = []
+    for obs_type, obs_list in observables.items():
+        if obs_type in _ASSET_OBSERVABLE_TYPES:
+            for obs in obs_list:
+                val = obs.get("observable_value", "")
+                if val and val not in impacted_assets:
+                    impacted_assets.append(val)
+
+    return {
+        "total_iocs": total_iocs,
+        "malware_count": _count_entity("malware"),
+        "attack_pattern_count": _count_entity("attack_pattern"),
+        "incident_count": _count_entity("incident"),
+        "impacted_assets": impacted_assets,
+    }
 
 
 class Connector:
     def __init__(self, config: ConnectorConfig, helper: OpenCTIConnectorHelper) -> None:
-        # Instantiate the connector helper from config
         self.config = config
         self.helper = helper
-
         self.current_dir = os.path.abspath(os.path.dirname(__file__)) + "/../"
         self._set_colors()
 
-    def _get_readable_date_time(self, str_date_time):
-        """
-        Convert ISO date times to readable format
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-        str_date_time: a str representing date/time in ISO format
-        """
-
+    def _get_readable_date_time(self, str_date_time: str) -> str:
+        """Convert an ISO datetime string to a human-readable format."""
         dt = datetime.datetime.fromisoformat(str_date_time)
         return dt.strftime("%B %d, %I:%M%p")
 
-    def _process_message(self, data):
+    def _jinja_env(self) -> Environment:
+        """Return a Jinja2 Environment pointing at self.current_dir."""
+        return Environment(
+            loader=FileSystemLoader(self.current_dir), finalize=self._finalize
+        )
+
+    def _render_pdf(self, html_string: str) -> bytes:
+        """Render one HTML string to PDF bytes via WeasyPrint."""
+        return HTML(
+            string=html_string, base_url=f"{self.current_dir}/resources"
+        ).write_pdf()
+
+    def _merge_pdfs(self, *html_strings: str) -> bytes:
+        """
+        Render multiple HTML strings as separate WeasyPrint documents and
+        concatenate all pages into a single PDF binary.
+        """
+        docs = [
+            HTML(
+                string=html, base_url=f"{self.current_dir}/resources"
+            ).render()
+            for html in html_strings
+        ]
+        all_pages: list = []
+        for doc in docs:
+            all_pages.extend(doc.pages)
+        return docs[0].copy(all_pages).write_pdf()
+
+    def _build_world_map_png(self, entities: dict) -> str | None:
+        """
+        Build a base64-encoded PNG world map of targeted countries from
+        relationship entities. Returns a data-URI string or None if no
+        valid targets are found.
+        """
+        if "relationship" not in entities:
+            return None
+
+        world_map = World()
+        world_map.title = "Targeted Countries"
+        targeted_countries: list[str] = []
+
+        for relationship in entities["relationship"]:
+            if (
+                relationship.get("entity_type") == "targets"
+                and relationship.get("relationship_type") == "targets"
+                and relationship.get("to", {}).get("entity_type") == "Country"
+            ):
+                country_code = relationship["to"]["name"].lower()
+                if not self._validate_country_code(country_code):
+                    self.helper.log_warning(
+                        f"{country_code} is not a supported country code, skipping..."
+                    )
+                    continue
+                targeted_countries.append(country_code)
+
+        if not targeted_countries:
+            return None
+
+        world_map.add("Targeted Countries", targeted_countries)
+        svg_bytes = world_map.render()
+        png_bytes = io.BytesIO()
+        cairosvg.svg2png(bytestring=svg_bytes, write_to=png_bytes)
+        base64_png = base64.b64encode(png_bytes.getvalue()).decode()
+        return f"data:image/png;base64, {base64_png}"
+
+    def _collect_entity(self, context: dict, entity: dict, obj_entity_type: str) -> None:
+        """
+        Classify a STIX entity into context["entities"] or context["observables"],
+        applying indicator-only filtering and URL defanging as configured.
+        Mutates context in place.
+        """
+        if obj_entity_type == "StixFile" or StixCyberObservableTypes.has_value(
+            obj_entity_type
+        ):
+            if self.config.indicators_only and not entity.get("indicators"):
+                self.helper.log_info(
+                    f"Skipping {obj_entity_type} observable with value "
+                    f"{entity.get('observable_value')} as it was not an Indicator."
+                )
+                return
+            if obj_entity_type not in context["observables"]:
+                context["observables"][obj_entity_type] = []
+            if self.config.defang_urls and obj_entity_type == "Url":
+                entity["observable_value"] = entity["observable_value"].replace(
+                    "http", "hxxp", 1
+                )
+            context["observables"][obj_entity_type].append(entity)
+        else:
+            if obj_entity_type not in context["entities"]:
+                context["entities"][obj_entity_type] = []
+            context["entities"][obj_entity_type].append(entity)
+
+    def _company_context(self) -> dict:
+        """Return company address fields as a dict for template contexts."""
+        return {
+            "company_address_line_1": self.config.company_address_line_1,
+            "company_address_line_2": self.config.company_address_line_2,
+            "company_address_line_3": self.config.company_address_line_3,
+            "company_phone_number": self.config.company_phone_number,
+            "company_email": self.config.company_email,
+            "company_website": self.config.company_website,
+        }
+
+    # ------------------------------------------------------------------
+    # Message router
+    # ------------------------------------------------------------------
+
+    def _process_message(self, data: dict) -> str:
         file_name = data["file_name"]
         entity_id = data.get("entity_id")
         export_scope = data["export_scope"]
@@ -64,15 +264,7 @@ class Connector:
             )
         elif entity_type == "Report":
             self._process_report(entity_id, file_name, file_markings, access_filter)
-        elif entity_type == "Case-Incident":
-            self._process_case(
-                entity_id, file_name, entity_type, file_markings, access_filter
-            )
-        elif entity_type == "Case-Rfi":
-            self._process_case(
-                entity_id, file_name, entity_type, file_markings, access_filter
-            )
-        elif entity_type == "Case-Rft":
+        elif entity_type in ("Case-Incident", "Case-Rfi", "Case-Rft"):
             self._process_case(
                 entity_id, file_name, entity_type, file_markings, access_filter
             )
@@ -86,22 +278,29 @@ class Connector:
             self._process_vulnerability(entity_id, file_name, file_markings)
         else:
             raise ValueError(
-                f'This connector currently only handles the entity types: "Report", "Intrusion-Set", "Threat-Actor-Group", "Threat-Actor-Individual", "Case-Incident", "Case-Rfi", "Case-Rft", Vulnerability, not "{entity_type}".'
+                f'This connector currently only handles the entity types: "Report", '
+                f'"Intrusion-Set", "Threat-Actor-Group", "Threat-Actor-Individual", '
+                f'"Case-Incident", "Case-Rfi", "Case-Rft", "Vulnerability", '
+                f'not "{entity_type}".'
             )
 
         return "Export done"
 
+    # ------------------------------------------------------------------
+    # List export
+    # ------------------------------------------------------------------
+
     def _process_list(
         self,
-        file_name,
-        entity_id,
-        entity_type,
-        file_markings,
+        file_name: str,
+        entity_id: str | None,
+        entity_type: str,
+        file_markings: list,
         main_filter,
-        list_params,
+        list_params: dict | None,
         access_filter,
-        export_scope,
-    ):
+        export_scope: str,
+    ) -> None:
         if export_scope == "selection":
             list_filters = "selected_ids"
             entity_data_sdo = self.helper.api_impersonate.stix_domain_object.list(
@@ -114,7 +313,7 @@ class Connector:
                 filters=main_filter
             )
             entities_list = entity_data_sdo + entity_data_sco + entity_data_scr
-        else:  # export_scope = 'query'
+        else:  # export_scope == 'query'
             list_params_filters = (
                 list_params.get("filters") if list_params is not None else None
             )
@@ -143,163 +342,128 @@ class Connector:
             self.helper.log_info("Uploading: " + entity_type + " to " + file_name)
             list_filters = json.dumps(list_params)
 
-        if entities_list is not None:
-            list_marking = None
-            if len(file_markings) != 0:
-                list_marking = file_markings
-            list_report_date = datetime.datetime.now().strftime("%b %d %Y")
-            # Store context for usage in html template
-
-            if list_params is not None:
-                list_search = list_params.get("search", "No search keyword")
-            else:
-                list_search = "No search keyword"
-
-            context = {
-                "list_name": "Export of " + entity_type,
-                "list_search": list_search,
-                "list_filters": str(main_filter),
-                "list_marking": list_marking,
-                "list_report_date": list_report_date,
-                "company_address_line_1": self.config.company_address_line_1,
-                "company_address_line_2": self.config.company_address_line_2,
-                "company_address_line_3": self.config.company_address_line_3,
-                "company_phone_number": self.config.company_phone_number,
-                "company_email": self.config.company_email,
-                "company_website": self.config.company_website,
-                "entities": {},
-                "observables": {},
-            }
-            # Process each STIX Object
-            for entity in entities_list:
-                obj_entity_type = entity["entity_type"]
-                if obj_entity_type == "StixFile" or StixCyberObservableTypes.has_value(
-                    obj_entity_type
-                ):
-                    # If only include indicators and
-                    # the observable doesn't have an indicator, skip it
-                    if self.config.indicators_only and not entity["indicators"]:
-                        self.helper.log_info(
-                            f"Skipping {obj_entity_type} observable with value {entity['observable_value']} as it was not an Indicator."
-                        )
-                        continue
-
-                    if obj_entity_type not in context["observables"]:
-                        context["observables"][obj_entity_type] = []
-
-                    # Defang urls
-                    if self.config.defang_urls and obj_entity_type == "Url":
-                        entity["observable_value"] = entity["observable_value"].replace(
-                            "http", "hxxp", 1
-                        )
-
-                    context["observables"][obj_entity_type].append(entity)
-                else:
-                    if obj_entity_type not in context["entities"]:
-                        context["entities"][obj_entity_type] = []
-
-                    context["entities"][obj_entity_type].append(entity)
-
-                # Render html with input variables
-                env = Environment(
-                    loader=FileSystemLoader(self.current_dir), finalize=self._finalize
-                )
-
-                template = env.get_template("resources/list.html")
-                html_string = template.render(context)
-
-                # Generate pdf from html string
-                pdf_contents = HTML(
-                    string=html_string, base_url=f"{self.current_dir}/resources"
-                ).write_pdf()
-
-                # Upload the output pdf
-                self.helper.log_info(f"Uploading: {file_name}")
-                if entity_type == "Stix-Cyber-Observable":
-                    self.helper.api.stix_cyber_observable.push_list_export(
-                        entity_id,
-                        entity_type,
-                        file_name,
-                        file_markings,
-                        pdf_contents,
-                        list_filters,
-                    )
-                elif entity_type == "Stix-Core-Object":
-                    self.helper.api.stix_core_object.push_list_export(
-                        entity_id,
-                        entity_type,
-                        file_name,
-                        file_markings,
-                        pdf_contents,
-                        list_filters,
-                    )
-                else:
-                    self.helper.api.stix_domain_object.push_list_export(
-                        entity_id,
-                        entity_type,
-                        file_name,
-                        file_markings,
-                        pdf_contents,
-                        list_filters,
-                    )
-        else:
+        if entities_list is None:
             raise ValueError("An error occurred, the list is empty")
 
-    def _process_report(self, entity_id, file_name, file_markings, access_filter):
+        list_marking = file_markings if len(file_markings) != 0 else None
+        list_search = (
+            list_params.get("search", "No search keyword")
+            if list_params is not None
+            else "No search keyword"
+        )
+
+        context: dict = {
+            "list_name": "Export of " + entity_type,
+            "list_search": list_search,
+            "list_filters": str(main_filter),
+            "list_marking": list_marking,
+            "list_report_date": datetime.datetime.now().strftime("%b %d %Y"),
+            **self._company_context(),
+            "entities": {},
+            "observables": {},
+        }
+
+        for entity in entities_list:
+            self._collect_entity(context, entity, entity["entity_type"])
+
+        env = self._jinja_env()
+        html_string = env.get_template("resources/list.html").render(context)
+        pdf_contents = self._render_pdf(html_string)
+
+        self.helper.log_info(f"Uploading: {file_name}")
+        if entity_type == "Stix-Cyber-Observable":
+            self.helper.api.stix_cyber_observable.push_list_export(
+                entity_id,
+                entity_type,
+                file_name,
+                file_markings,
+                pdf_contents,
+                list_filters,
+            )
+        elif entity_type == "Stix-Core-Object":
+            self.helper.api.stix_core_object.push_list_export(
+                entity_id,
+                entity_type,
+                file_name,
+                file_markings,
+                pdf_contents,
+                list_filters,
+            )
+        else:
+            self.helper.api.stix_domain_object.push_list_export(
+                entity_id,
+                entity_type,
+                file_name,
+                file_markings,
+                pdf_contents,
+                list_filters,
+            )
+
+    # ------------------------------------------------------------------
+    # Report export  (dashboard + content pages)
+    # ------------------------------------------------------------------
+
+    def _process_report(
+        self,
+        entity_id: str,
+        file_name: str,
+        file_markings: list,
+        access_filter,
+    ) -> None:
         """
-        Process a Report entity and upload as pdf.
+        Process a Report entity and upload as a multi-page PDF.
+          Page 2: dashboard.html  (Intelligence Summary)
+          Page 3+: content.html  (Two-column threat analysis body)
         """
-        # Get the Report
         report_dict = self.helper.api_impersonate.report.read(id=entity_id)
         content_query = '{report (id:"' + entity_id + '") {content}}'
         report_dict["content"] = (
             self.helper.api_impersonate.query(query=content_query)
         )["data"]["report"].get("content", "No content available.")
 
-        # Extract values for inclusion in output pdf
-        report_marking = report_dict.get("objectMarking", None)
-        if report_marking:
-            report_marking = report_marking[-1]["definition"]
-        report_name = report_dict["name"]
+        report_marking_list = report_dict.get("objectMarking") or []
+        report_marking_str = (
+            report_marking_list[-1]["definition"] if report_marking_list else None
+        )
+
         report_description = (
             report_dict.get("description") or "No description available."
         )
-        report_description = cmarkgfm.github_flavored_markdown_to_html(
+        report_description_html = cmarkgfm.github_flavored_markdown_to_html(
             report_description, CMARKGFM_OPTIONS
         )
-        report_content = report_dict["content"]
-        report_confidence = report_dict["confidence"]
-        report_id = report_dict["id"]
-        report_external_refs = [
-            external_ref_dict["url"]
-            for external_ref_dict in report_dict["externalReferences"]
-        ]
-        report_objs = report_dict["objects"]
-        report_date = datetime.datetime.now().strftime("%b %d %Y")
 
-        context = {
-            "report_name": report_name,
-            "report_description": report_description,
-            "report_content": report_content,
-            "report_marking": report_marking,
-            "report_confidence": report_confidence,
-            "report_external_refs": report_external_refs,
-            "report_date": report_date,
-            "company_address_line_1": self.config.company_address_line_1,
-            "company_address_line_2": self.config.company_address_line_2,
-            "company_address_line_3": self.config.company_address_line_3,
-            "company_phone_number": self.config.company_phone_number,
-            "company_email": self.config.company_email,
-            "company_website": self.config.company_website,
+        raw_content = report_dict.get("content") or "No content available."
+        report_content_html = _process_callouts(
+            cmarkgfm.github_flavored_markdown_to_html(raw_content, CMARKGFM_OPTIONS)
+        )
+
+        context: dict = {
+            "report_name": report_dict["name"],
+            "report_description": report_description_html,
+            "report_content_html": report_content_html,
+            "report_marking": report_marking_str,
+            "report_confidence": report_dict["confidence"],
+            "report_external_refs": [
+                ref["url"] for ref in report_dict.get("externalReferences", [])
+            ],
+            "report_date": datetime.datetime.now().strftime("%b %d %Y"),
+            "report_creator": (report_dict.get("createdBy") or {}).get("name", "N/A"),
+            # Dashboard fields (enriched below after entity loop)
+            "risk_level": None,
+            "cvss_score": None,
+            "exploitability": None,
+            "analysis_start": None,
+            "analysis_end": None,
+            "total_pages": 3,
+            "current_page": 2,
+            **self._company_context(),
             "entities": {},
             "observables": {},
         }
 
-        object_ids = []
-        for report_obj in report_objs:
-            object_ids.append(report_obj["id"])
-
-        if len(object_ids) != 0:
+        object_ids = [obj["id"] for obj in report_dict.get("objects", [])]
+        if object_ids:
             export_filter = self.helper.api.stix2.prepare_id_filters_export(
                 object_ids, access_filter
             )
@@ -308,151 +472,66 @@ class Connector:
                     filters=export_filter
                 )
             )
-
             for entity in entities_list:
-                obj_entity_type = entity["entity_type"]
-                if obj_entity_type == "StixFile" or StixCyberObservableTypes.has_value(
-                    obj_entity_type
-                ):
-                    # If only include indicators and
-                    # the observable doesn't have an indicator, skip it
-                    if self.config.indicators_only and not entity["indicators"]:
-                        self.helper.log_info(
-                            f"Skipping {obj_entity_type} observable with value {entity['observable_value']} as it was not an Indicator."
-                        )
-                        continue
+                self._collect_entity(context, entity, entity["entity_type"])
 
-                    if obj_entity_type not in context["observables"]:
-                        context["observables"][obj_entity_type] = []
-
-                    # Defang urls
-                    if self.config.defang_urls and obj_entity_type == "Url":
-                        entity["observable_value"] = entity["observable_value"].replace(
-                            "http", "hxxp", 1
-                        )
-
-                    context["observables"][obj_entity_type].append(entity)
-
-                else:
-                    if obj_entity_type not in context["entities"]:
-                        context["entities"][obj_entity_type] = []
-
-                    context["entities"][obj_entity_type].append(entity)
-
-        # Render html with input variables
-        env = Environment(
-            loader=FileSystemLoader(self.current_dir), finalize=self._finalize
+        context.update(
+            _build_dashboard_context(context["entities"], context["observables"])
         )
-        template = env.get_template("resources/report.html")
-        html_string = template.render(context)
 
-        # Generate pdf from html string
-        pdf_contents = HTML(
-            string=html_string, base_url=f"{self.current_dir}/resources"
-        ).write_pdf()
+        env = self._jinja_env()
+        html_dashboard = env.get_template("resources/dashboard.html").render(context)
 
-        # Upload the output pdf
+        context["current_page"] = 3
+        html_content = env.get_template("resources/content.html").render(context)
+
+        pdf_contents = self._merge_pdfs(html_dashboard, html_content)
+
         self.helper.log_info(f"Uploading: {file_name}")
         self.helper.api.stix_domain_object.push_entity_export(
-            entity_id=report_id,
+            entity_id=report_dict["id"],
             file_name=file_name,
             data=pdf_contents,
             file_markings=file_markings,
             mime_type="application/pdf",
         )
 
-    def _process_intrusion_set(self, entity_id, file_name, file_markings):
-        """
-        Process an Intrusion Set entity and upload as pdf.
-        """
+    # ------------------------------------------------------------------
+    # Intrusion Set export
+    # ------------------------------------------------------------------
 
-        now_date = datetime.datetime.now().strftime("%b %d %Y")
-
-        # Store context for usage in html template
-        context = {
+    def _process_intrusion_set(
+        self, entity_id: str, file_name: str, file_markings: list
+    ) -> None:
+        """Process an Intrusion Set entity and upload as PDF."""
+        context: dict = {
             "entities": {},
             "target_map_country": None,
-            "report_date": now_date,
-            "company_address_line_1": self.config.company_address_line_1,
-            "company_address_line_2": self.config.company_address_line_2,
-            "company_address_line_3": self.config.company_address_line_3,
-            "company_phone_number": self.config.company_phone_number,
-            "company_email": self.config.company_email,
-            "company_website": self.config.company_website,
+            "report_date": datetime.datetime.now().strftime("%b %d %Y"),
+            **self._company_context(),
         }
 
-        # Get a bundle of all objects affiliated with the intrusion set
-        intrusion_set_objs = (
-            self.helper.api_impersonate.stix2.get_stix_bundle_or_object_from_entity_id(
-                entity_type="Intrusion-Set", entity_id=entity_id, mode="full"
-            )
+        bundle = self.helper.api_impersonate.stix2.get_stix_bundle_or_object_from_entity_id(
+            entity_type="Intrusion-Set", entity_id=entity_id, mode="full"
         )
-
-        for intrusion_set_obj in intrusion_set_objs["objects"]:
-            obj_id = intrusion_set_obj["id"]
-            obj_entity_type = intrusion_set_obj["type"]
-
-            reader_func = self._get_reader(obj_entity_type)
+        for obj in bundle["objects"]:
+            reader_func = self._get_reader(obj["type"])
             if reader_func is None:
                 self.helper.log_error(
-                    f'Could not find a function to read entity with type "{obj_entity_type}"'
+                    f'Could not find a function to read entity with type "{obj["type"]}"'
                 )
                 continue
-
             time.sleep(0.3)
-            entity_dict = reader_func(id=obj_id)
+            entity_dict = reader_func(id=obj["id"])
+            key = obj["type"].replace("-", "_")
+            context["entities"].setdefault(key, []).append(entity_dict)
 
-            # Key names cannot have - in them for jinja2 templating
-            obj_entity_type = obj_entity_type.replace("-", "_")
-            if obj_entity_type not in context["entities"]:
-                context["entities"][obj_entity_type] = []
+        context["target_map_country"] = self._build_world_map_png(context["entities"])
 
-            context["entities"][obj_entity_type].append(entity_dict)
+        env = self._jinja_env()
+        html_string = env.get_template("resources/intrusion-set.html").render(context)
+        pdf_contents = self._render_pdf(html_string)
 
-        # Generate the svg img contents for the targets map
-        if "relationship" in context["entities"]:
-            # Create world map
-            world_map = World()
-            world_map.title = "Targeted Countries"
-            targeted_countries = []
-            for relationship in context["entities"]["relationship"]:
-                if (
-                    relationship["entity_type"] == "targets"
-                    and relationship["relationship_type"] == "targets"
-                    and relationship["to"]["entity_type"] == "Country"
-                ):
-                    country_code = relationship["to"]["name"].lower()
-                    if not self._validate_country_code(country_code):
-                        self.helper.log_warning(
-                            f"{country_code} is not a supported country code, skipping..."
-                        )
-                        continue
-
-                    targeted_countries.append(country_code)
-
-            # Build targeted countries image
-            if targeted_countries:
-                world_map.add("Targeted Countries", targeted_countries)
-                # Convert the svg to base64 png
-                svg_bytes = world_map.render()
-                png_bytes = io.BytesIO()
-                cairosvg.svg2png(bytestring=svg_bytes, write_to=png_bytes)
-                base64_png = base64.b64encode(png_bytes.getvalue()).decode()
-                context["target_map_country"] = f"data:image/png;base64, {base64_png}"
-
-        # Render html with input variables
-        env = Environment(
-            loader=FileSystemLoader(self.current_dir), finalize=self._finalize
-        )
-        template = env.get_template("resources/intrusion-set.html")
-        html_string = template.render(context)
-
-        # Generate pdf from html string
-        pdf_contents = HTML(
-            string=html_string, base_url=f"{self.current_dir}/resources"
-        ).write_pdf()
-
-        # Upload the output pdf
         self.helper.log_info(f"Uploading: {file_name}")
         self.helper.api.stix_domain_object.push_entity_export(
             entity_id=entity_id,
@@ -462,98 +541,42 @@ class Connector:
             mime_type="application/pdf",
         )
 
-    def _process_threat_actor_group(self, entity_id, file_name, file_markings):
-        """
-        Process a Threat Actor Group entity and upload as pdf.
-        """
+    # ------------------------------------------------------------------
+    # Threat Actor Group export
+    # ------------------------------------------------------------------
 
-        now_date = datetime.datetime.now().strftime("%b %d %Y")
-
-        # Store context for usage in html template
-        context = {
+    def _process_threat_actor_group(
+        self, entity_id: str, file_name: str, file_markings: list
+    ) -> None:
+        """Process a Threat Actor Group entity and upload as PDF."""
+        context: dict = {
             "entities": {},
             "target_map_country": None,
-            "report_date": now_date,
-            "company_address_line_1": self.config.company_address_line_1,
-            "company_address_line_2": self.config.company_address_line_2,
-            "company_address_line_3": self.config.company_address_line_3,
-            "company_phone_number": self.config.company_phone_number,
-            "company_email": self.config.company_email,
-            "company_website": self.config.company_website,
+            "report_date": datetime.datetime.now().strftime("%b %d %Y"),
+            **self._company_context(),
         }
 
-        # Get a bundle of all objects affiliated with the threat actor group
-        bundle = (
-            self.helper.api_impersonate.stix2.get_stix_bundle_or_object_from_entity_id(
-                entity_type="Threat-Actor-Group", entity_id=entity_id, mode="full"
-            )
+        bundle = self.helper.api_impersonate.stix2.get_stix_bundle_or_object_from_entity_id(
+            entity_type="Threat-Actor-Group", entity_id=entity_id, mode="full"
         )
-
-        for bundle_obj in bundle["objects"]:
-            obj_id = bundle_obj["id"]
-            obj_entity_type = bundle_obj["type"]
-
-            reader_func = self._get_reader(obj_entity_type)
+        for obj in bundle["objects"]:
+            reader_func = self._get_reader(obj["type"])
             if reader_func is None:
                 self.helper.log_error(
-                    f'Could not find a function to read entity with type "{obj_entity_type}"'
+                    f'Could not find a function to read entity with type "{obj["type"]}"'
                 )
                 continue
-
             time.sleep(0.3)
-            entity_dict = reader_func(id=obj_id)
+            entity_dict = reader_func(id=obj["id"])
+            key = obj["type"].replace("-", "_")
+            context["entities"].setdefault(key, []).append(entity_dict)
 
-            # Key names cannot have - in them for jinja2 templating
-            obj_entity_type = obj_entity_type.replace("-", "_")
-            if obj_entity_type not in context["entities"]:
-                context["entities"][obj_entity_type] = []
+        context["target_map_country"] = self._build_world_map_png(context["entities"])
 
-            context["entities"][obj_entity_type].append(entity_dict)
+        env = self._jinja_env()
+        html_string = env.get_template("resources/threat-actor.html").render(context)
+        pdf_contents = self._render_pdf(html_string)
 
-        # Generate the svg img contents for the targets map
-        if "relationship" in context["entities"]:
-            # Create world map
-            world_map = World()
-            world_map.title = "Targeted Countries"
-            targeted_countries = []
-            for relationship in context["entities"]["relationship"]:
-                if (
-                    relationship["entity_type"] == "targets"
-                    and relationship["relationship_type"] == "targets"
-                    and relationship["to"]["entity_type"] == "Country"
-                ):
-                    country_code = relationship["to"]["name"].lower()
-                    if not self._validate_country_code(country_code):
-                        self.helper.log_warning(
-                            f"{country_code} is not a supported country code, skipping..."
-                        )
-                        continue
-
-                    targeted_countries.append(country_code)
-
-            # Build targeted countries image
-            if targeted_countries:
-                world_map.add("Targeted Countries", targeted_countries)
-                # Convert the svg to base64 png
-                svg_bytes = world_map.render()
-                png_bytes = io.BytesIO()
-                cairosvg.svg2png(bytestring=svg_bytes, write_to=png_bytes)
-                base64_png = base64.b64encode(png_bytes.getvalue()).decode()
-                context["target_map_country"] = f"data:image/png;base64, {base64_png}"
-
-        # Render html with input variables
-        env = Environment(
-            loader=FileSystemLoader(self.current_dir), finalize=self._finalize
-        )
-        template = env.get_template("resources/threat-actor.html")
-        html_string = template.render(context)
-
-        # Generate pdf from html string
-        pdf_contents = HTML(
-            string=html_string, base_url=f"{self.current_dir}/resources"
-        ).write_pdf()
-
-        # Upload the output pdf
         self.helper.log_info(f"Uploading: {file_name}")
         self.helper.api.stix_domain_object.push_entity_export(
             entity_id=entity_id,
@@ -563,98 +586,42 @@ class Connector:
             mime_type="application/pdf",
         )
 
-    def _process_threat_actor_individual(self, entity_id, file_name, file_markings):
-        """
-        Process a Threat Actor Individual entity and upload as pdf.
-        """
+    # ------------------------------------------------------------------
+    # Threat Actor Individual export
+    # ------------------------------------------------------------------
 
-        now_date = datetime.datetime.now().strftime("%b %d %Y")
-
-        # Store context for usage in html template
-        context = {
+    def _process_threat_actor_individual(
+        self, entity_id: str, file_name: str, file_markings: list
+    ) -> None:
+        """Process a Threat Actor Individual entity and upload as PDF."""
+        context: dict = {
             "entities": {},
             "target_map_country": None,
-            "report_date": now_date,
-            "company_address_line_1": self.config.company_address_line_1,
-            "company_address_line_2": self.config.company_address_line_2,
-            "company_address_line_3": self.config.company_address_line_3,
-            "company_phone_number": self.config.company_phone_number,
-            "company_email": self.config.company_email,
-            "company_website": self.config.company_website,
+            "report_date": datetime.datetime.now().strftime("%b %d %Y"),
+            **self._company_context(),
         }
 
-        # Get a bundle of all objects affiliated with the threat actor individual
-        bundle = (
-            self.helper.api_impersonate.stix2.get_stix_bundle_or_object_from_entity_id(
-                entity_type="Threat-Actor-Individual", entity_id=entity_id, mode="full"
-            )
+        bundle = self.helper.api_impersonate.stix2.get_stix_bundle_or_object_from_entity_id(
+            entity_type="Threat-Actor-Individual", entity_id=entity_id, mode="full"
         )
-
-        for bundle_obj in bundle["objects"]:
-            obj_id = bundle_obj["id"]
-            obj_entity_type = bundle_obj["type"]
-
-            reader_func = self._get_reader(obj_entity_type)
+        for obj in bundle["objects"]:
+            reader_func = self._get_reader(obj["type"])
             if reader_func is None:
                 self.helper.log_error(
-                    f'Could not find a function to read entity with type "{obj_entity_type}"'
+                    f'Could not find a function to read entity with type "{obj["type"]}"'
                 )
                 continue
-
             time.sleep(0.3)
-            entity_dict = reader_func(id=obj_id)
+            entity_dict = reader_func(id=obj["id"])
+            key = obj["type"].replace("-", "_")
+            context["entities"].setdefault(key, []).append(entity_dict)
 
-            # Key names cannot have - in them for jinja2 templating
-            obj_entity_type = obj_entity_type.replace("-", "_")
-            if obj_entity_type not in context["entities"]:
-                context["entities"][obj_entity_type] = []
+        context["target_map_country"] = self._build_world_map_png(context["entities"])
 
-            context["entities"][obj_entity_type].append(entity_dict)
+        env = self._jinja_env()
+        html_string = env.get_template("resources/threat-actor.html").render(context)
+        pdf_contents = self._render_pdf(html_string)
 
-        # Generate the svg img contents for the targets map
-        if "relationship" in context["entities"]:
-            # Create world map
-            world_map = World()
-            world_map.title = "Targeted Countries"
-            targeted_countries = []
-            for relationship in context["entities"]["relationship"]:
-                if (
-                    relationship["entity_type"] == "targets"
-                    and relationship["relationship_type"] == "targets"
-                    and relationship["to"]["entity_type"] == "Country"
-                ):
-                    country_code = relationship["to"]["name"].lower()
-                    if not self._validate_country_code(country_code):
-                        self.helper.log_warning(
-                            f"{country_code} is not a supported country code, skipping..."
-                        )
-                        continue
-
-                    targeted_countries.append(country_code)
-
-            # Build targeted countries image
-            if targeted_countries:
-                world_map.add("Targeted Countries", targeted_countries)
-                # Convert the svg to base64 png
-                svg_bytes = world_map.render()
-                png_bytes = io.BytesIO()
-                cairosvg.svg2png(bytestring=svg_bytes, write_to=png_bytes)
-                base64_png = base64.b64encode(png_bytes.getvalue()).decode()
-                context["target_map_country"] = f"data:image/png;base64, {base64_png}"
-
-        # Render html with input variables
-        env = Environment(
-            loader=FileSystemLoader(self.current_dir), finalize=self._finalize
-        )
-        template = env.get_template("resources/threat-actor.html")
-        html_string = template.render(context)
-
-        # Generate pdf from html string
-        pdf_contents = HTML(
-            string=html_string, base_url=f"{self.current_dir}/resources"
-        ).write_pdf()
-
-        # Upload the output pdf
         self.helper.log_info(f"Uploading: {file_name}")
         self.helper.api.stix_domain_object.push_entity_export(
             entity_id=entity_id,
@@ -663,14 +630,20 @@ class Connector:
             file_markings=file_markings,
             mime_type="application/pdf",
         )
+
+    # ------------------------------------------------------------------
+    # Case export
+    # ------------------------------------------------------------------
 
     def _process_case(
-        self, entity_id, file_name, entity_type, file_markings, access_filter
-    ):
-        """
-        Process a Case container and upload as pdf.
-        """
-        # Get the Case container
+        self,
+        entity_id: str,
+        file_name: str,
+        entity_type: str,
+        file_markings: list,
+        access_filter,
+    ) -> None:
+        """Process a Case container (Incident / Rfi / Rft) and upload as PDF."""
         if entity_type == "Case-Incident":
             case_dict = self.helper.api_impersonate.case_incident.read(id=entity_id)
         elif entity_type == "Case-Rfi":
@@ -681,61 +654,42 @@ class Connector:
             raise ValueError(f"Unrecognized entity_type: {entity_type}")
 
         content_query = '{case (id:"' + entity_id + '") {content}}'
-        case_dict["content"] = (self.helper.api_impersonate.query(query=content_query))[
-            "data"
-        ]["case"].get("content", "No content available.")
+        case_dict["content"] = (
+            self.helper.api_impersonate.query(query=content_query)
+        )["data"]["case"].get("content", "No content available.")
 
-        # Extract values for inclusion in output pdf
-        case_name = case_dict["name"]
+        case_marking_list = case_dict.get("objectMarking") or []
+        case_marking_str = (
+            case_marking_list[-1]["definition"] if case_marking_list else None
+        )
+
         case_description = case_dict.get("description") or "No description available."
-        case_description = cmarkgfm.github_flavored_markdown_to_html(
+        case_description_html = cmarkgfm.github_flavored_markdown_to_html(
             case_description, CMARKGFM_OPTIONS
         )
-        case_content = case_dict["content"]
-        case_marking = case_dict.get("objectMarking", None)
-        if case_marking:
-            case_marking = case_marking[-1]["definition"]
-        case_external_refs = [
-            external_ref_dict["url"]
-            for external_ref_dict in case_dict["externalReferences"]
-        ]
-        case_confidence = case_dict["confidence"]
-        case_id = case_dict["id"]
-        case_objs = case_dict["objects"]
-        case_report_date = datetime.datetime.now().strftime("%b %d %Y")
-        case_type = case_dict["entity_type"]
-        case_priority = case_dict["priority"]
-        case_severity = case_dict["severity"]
-        case_tasks = case_dict["tasks"]
-        # Store context for usage in html template
-        context = {
-            "case_name": case_name,
-            "case_description": case_description,
-            "case_content": case_content,
-            "case_marking": case_marking,
-            "case_confidence": case_confidence,
-            "case_id": case_id,
-            "case_external_refs": case_external_refs,
-            "case_report_date": case_report_date,
-            "company_address_line_1": self.config.company_address_line_1,
-            "company_address_line_2": self.config.company_address_line_2,
-            "company_address_line_3": self.config.company_address_line_3,
-            "company_phone_number": self.config.company_phone_number,
-            "company_email": self.config.company_email,
-            "company_website": self.config.company_website,
-            "tasks": case_tasks,
-            "case_type": case_type,
-            "case_priority": case_priority,
-            "case_severity": case_severity,
+
+        context: dict = {
+            "case_name": case_dict["name"],
+            "case_description": case_description_html,
+            "case_content": case_dict["content"],
+            "case_marking": case_marking_str,
+            "case_confidence": case_dict["confidence"],
+            "case_id": case_dict["id"],
+            "case_external_refs": [
+                ref["url"] for ref in case_dict.get("externalReferences", [])
+            ],
+            "case_report_date": datetime.datetime.now().strftime("%b %d %Y"),
+            "tasks": case_dict["tasks"],
+            "case_type": case_dict["entity_type"],
+            "case_priority": case_dict["priority"],
+            "case_severity": case_dict["severity"],
+            **self._company_context(),
             "entities": {},
             "observables": {},
         }
 
-        object_ids = []
-        for case_obj in case_objs:
-            object_ids.append(case_obj["id"])
-
-        if len(object_ids) != 0:
+        object_ids = [obj["id"] for obj in case_dict.get("objects", [])]
+        if object_ids:
             export_filter = self.helper.api.stix2.prepare_id_filters_export(
                 object_ids, access_filter
             )
@@ -744,51 +698,13 @@ class Connector:
                     filters=export_filter
                 )
             )
-
-            # Process each STIX Object
             for entity in entities_list:
-                obj_entity_type = entity["entity_type"]
-                if obj_entity_type == "StixFile" or StixCyberObservableTypes.has_value(
-                    obj_entity_type
-                ):
-                    # If only include indicators and
-                    # the observable doesn't have an indicator, skip it
-                    if self.config.indicators_only and not entity["indicators"]:
-                        self.helper.log_info(
-                            f"Skipping {obj_entity_type} observable with value {entity['observable_value']} as it was not an Indicator."
-                        )
-                        continue
+                self._collect_entity(context, entity, entity["entity_type"])
 
-                    if obj_entity_type not in context["observables"]:
-                        context["observables"][obj_entity_type] = []
+        env = self._jinja_env()
+        html_string = env.get_template("resources/case.html").render(context)
+        pdf_contents = self._render_pdf(html_string)
 
-                    # Defang urls
-                    if self.config.defang_urls and obj_entity_type == "Url":
-                        entity["observable_value"] = entity["observable_value"].replace(
-                            "http", "hxxp", 1
-                        )
-
-                    context["observables"][obj_entity_type].append(entity)
-                else:
-                    if obj_entity_type not in context["entities"]:
-                        context["entities"][obj_entity_type] = []
-
-                    context["entities"][obj_entity_type].append(entity)
-
-        # Render html with input variables
-        env = Environment(
-            loader=FileSystemLoader(self.current_dir), finalize=self._finalize
-        )
-
-        template = env.get_template("resources/case.html")
-        html_string = template.render(context)
-
-        # Generate pdf from html string
-        pdf_contents = HTML(
-            string=html_string, base_url=f"{self.current_dir}/resources"
-        ).write_pdf()
-
-        # Upload the output pdf
         self.helper.log_info(f"Uploading: {file_name}")
         self.helper.api.stix_domain_object.push_entity_export(
             entity_id=entity_id,
@@ -798,21 +714,17 @@ class Connector:
             mime_type="application/pdf",
         )
 
-    def _process_vulnerability(self, entity_id, file_name, file_markings):
-        """
-        Process a Vulnerability entity and upload as pdf.
-        """
-        now_date = datetime.datetime.now().strftime("%b %d %Y")
-        # Prepare our context
-        context = {
-            "report_date": now_date,
-            "company_address_line_1": self.config.company_address_line_1,
-            "company_address_line_2": self.config.company_address_line_2,
-            "company_address_line_3": self.config.company_address_line_3,
-            "company_phone_number": self.config.company_phone_number,
-            "company_email": self.config.company_email,
-            "company_website": self.config.company_website,
-            # these will be filled in:
+    # ------------------------------------------------------------------
+    # Vulnerability export
+    # ------------------------------------------------------------------
+
+    def _process_vulnerability(
+        self, entity_id: str, file_name: str, file_markings: list
+    ) -> None:
+        """Process a Vulnerability entity and upload as PDF."""
+        context: dict = {
+            "report_date": datetime.datetime.now().strftime("%b %d %Y"),
+            **self._company_context(),
             "vulnerability": None,
             "softwares_impacted": [],
             "softwares_resolved": [],
@@ -820,68 +732,45 @@ class Connector:
             "infrastructures": [],
         }
 
-        # Retrieve the full STIX bundle
-        bundle = (
-            self.helper.api_impersonate.stix2.get_stix_bundle_or_object_from_entity_id(
-                entity_type="Vulnerability", entity_id=entity_id, mode="full"
-            )
+        bundle = self.helper.api_impersonate.stix2.get_stix_bundle_or_object_from_entity_id(
+            entity_type="Vulnerability", entity_id=entity_id, mode="full"
         )
 
-        entities_grouped_by_type_and_id = {
-            entity_type: {
-                entity["id"]: entity
-                for entity in bundle["objects"]
-                if entity["type"] == entity_type
-            }
-            for entity_type in {entity["type"] for entity in bundle["objects"]}
+        entities_grouped: dict = {
+            etype: {e["id"]: e for e in bundle["objects"] if e["type"] == etype}
+            for etype in {e["type"] for e in bundle["objects"]}
         }
 
-        # We have only one vulnerability in the bundle
-        _vulnerability = next(
-            iter(entities_grouped_by_type_and_id["vulnerability"].values())
-        )
-
-        context["vulnerability"] = _vulnerability
+        vulnerability = next(iter(entities_grouped["vulnerability"].values()))
+        context["vulnerability"] = vulnerability
         context["marking_definitions"] = [
-            entities_grouped_by_type_and_id["marking-definition"][marking_ref]["name"]
-            for marking_ref in _vulnerability.get("object_marking_refs", [])
+            entities_grouped["marking-definition"][ref]["name"]
+            for ref in vulnerability.get("object_marking_refs", [])
         ]
 
-        # Process each relationship in the bundle
-        for relationship in entities_grouped_by_type_and_id.get(
-            "relationship", {}
-        ).values():
-            source_ref_type = relationship["source_ref"].split("--")[0]
-            source_ref = entities_grouped_by_type_and_id[source_ref_type][
-                relationship["source_ref"]
-            ]
-            match relationship["relationship_type"], source_ref_type:
+        for relationship in entities_grouped.get("relationship", {}).values():
+            src_type = relationship["source_ref"].split("--")[0]
+            src = entities_grouped[src_type][relationship["source_ref"]]
+            match relationship["relationship_type"], src_type:
                 case "has", "software":
-                    softwares_impacted = f"{source_ref['vendor']}-{source_ref['name']}"
-                    if "version" in source_ref:
-                        softwares_impacted += f"-{source_ref['version']}"
-                    context["softwares_impacted"].append(softwares_impacted)
+                    entry = f"{src['vendor']}-{src['name']}"
+                    if "version" in src:
+                        entry += f"-{src['version']}"
+                    context["softwares_impacted"].append(entry)
                 case "remediates", "software":
-                    softwares_resolved = f"{source_ref['vendor']}-{source_ref['name']}"
-                    if "version" in source_ref:
-                        softwares_resolved += f"-{source_ref['version']}"
-                    context["softwares_resolved"].append(softwares_resolved)
+                    entry = f"{src['vendor']}-{src['name']}"
+                    if "version" in src:
+                        entry += f"-{src['version']}"
+                    context["softwares_resolved"].append(entry)
                 case "remediates", "course-of-action":
-                    context["courses_of_action"].append(f"{source_ref['name']}")
+                    context["courses_of_action"].append(src["name"])
                 case "has", "infrastructure":
-                    context["infrastructures"].append(f"{source_ref['name']}")
+                    context["infrastructures"].append(src["name"])
 
-        # Render HTML and generate the PDF
-        env = Environment(
-            loader=FileSystemLoader(self.current_dir), finalize=self._finalize
-        )
-        template = env.get_template("resources/vulnerability.html")
-        html_string = template.render(context)
-        pdf_contents = HTML(
-            string=html_string, base_url=f"{self.current_dir}/resources"
-        ).write_pdf()
+        env = self._jinja_env()
+        html_string = env.get_template("resources/vulnerability.html").render(context)
+        pdf_contents = self._render_pdf(html_string)
 
-        # Push it back into OpenCTI
         self.helper.log_info(f"Uploading Vulnerability PDF: {file_name}")
         self.helper.api.stix_domain_object.push_entity_export(
             entity_id=entity_id,
@@ -891,44 +780,40 @@ class Connector:
             mime_type="application/pdf",
         )
 
-    def _set_colors(self):
-        for root, dirs, files in os.walk(self.current_dir):
+    # ------------------------------------------------------------------
+    # Startup utilities
+    # ------------------------------------------------------------------
+
+    def _set_colors(self) -> None:
+        """
+        Substitute <primary_color> and <secondary_color> in all
+        .css.template files and write the resulting .css files.
+        """
+        for root, _dirs, files in os.walk(self.current_dir):
             for file_name in files:
-                if file_name.endswith(".css.template"):
-                    with open(os.path.join(root, file_name), "r") as f:
-                        new_css = f.read()
-                        new_css = new_css.replace(
-                            "<primary_color>", self.config.primary_color
-                        )
-                        new_css = new_css.replace(
-                            "<secondary_color>", self.config.secondary_color
-                        )
+                if not file_name.endswith(".css.template"):
+                    continue
+                template_path = os.path.join(root, file_name)
+                with open(template_path) as f:
+                    css = f.read()
+                css = css.replace("<primary_color>", self.config.primary_color)
+                css = css.replace("<secondary_color>", self.config.secondary_color)
+                out_path = os.path.join(root, file_name.replace(".template", ""))
+                with open(out_path, "w") as f:
+                    f.write(css)
 
-                    file_name = file_name.replace(".template", "")
-                    with open(os.path.join(root, file_name), "w") as f:
-                        f.write(new_css)
-
-    def _validate_country_code(self, country_code):
-        """
-        Returns a boolean indicating whether or not the country code is valid.
-        """
-        if country_code in COUNTRIES:
-            return True
-        return False
+    def _validate_country_code(self, country_code: str) -> bool:
+        """Return True if country_code is a valid pygal country code."""
+        return country_code in COUNTRIES
 
     def _finalize(self, data):
-        """
-        Used for rendering jinja2 template to supress None
-        """
+        """Jinja2 finalizer: suppress None values as 'N/A'."""
         return data if data is not None else "N/A"
 
-    def _get_reader(self, entity_type):
+    def _get_reader(self, entity_type: str):
         """
-        Returns the function to use for reading the data of a particular entity type.
-
-        entity_type: a str representing the entity type, i.e. Indicator
-
-        returns: a function or None if entity type is not supported
+        Return the API reader function for a given STIX entity type string,
+        or None if the type is not supported.
         """
         reader = {
             "stix-core-object": self.helper.api_impersonate.stix_core_object.read,
@@ -972,6 +857,9 @@ class Connector:
         }
         return reader.get(entity_type.lower(), None)
 
-    # Start the main loop
-    def run(self):
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
+
+    def run(self) -> None:
         self.helper.listen(self._process_message)

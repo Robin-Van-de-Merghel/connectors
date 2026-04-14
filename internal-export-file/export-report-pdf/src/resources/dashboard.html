@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+{#
+  dashboard.html — Page 2: Intelligence Summary Dashboard
+  =========================================================
+  Context variables:
+    report_name, report_marking, report_date, report_confidence
+    report_creator, analysis_start, analysis_end
+    risk_level, cvss_score, exploitability
+    total_iocs, malware_count, attack_pattern_count, incident_count
+    impacted_assets (list[str])
+    total_pages, current_page
+#}
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ report_name }} — Intelligence Summary</title>
+  <style>
+    @font-face { font-family:"Fira Sans"; font-weight:400; src:url(firasans-regular.otf); }
+    @font-face { font-family:"Fira Sans"; font-weight:700; src:url(firasans-bold.otf); }
+    @font-face { font-family:"Fira Sans"; font-style:italic; font-weight:400; src:url(firasans-italic.otf); }
+
+    @page { size:A4; margin:0; }
+    * { box-sizing:border-box; margin:0; padding:0; }
+
+    html, body {
+      font-family:"Fira Sans","Helvetica Neue",Arial,sans-serif;
+      font-size:12px; color:#444; background:#fff; width:210mm;
+    }
+
+    /* ── TLP header ── */
+    .tlp-header {
+      display:flex; justify-content:space-between; align-items:center;
+      width:100%; padding:8px 24px; border-bottom:0.5px solid #ddd;
+      font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.6px;
+    }
+    .tlp-red   { background:#000; color:#FF2B2B; }
+    .tlp-amber { background:#000; color:#FFC000; }
+    .tlp-green { background:#000; color:#33FF00; }
+    .tlp-clear { background:#000; color:#fff; }
+    .tlp-right { color:#999; font-size:10px; font-weight:400; letter-spacing:0.3px; text-transform:none; }
+
+    /* ── Page wrapper ── */
+    .page { padding:28px 40px 60px; }
+
+    /* ── Page title ── */
+    .page-title { font-size:24px; font-weight:700; color:#0a1628; letter-spacing:-0.5px; margin-bottom:24px; }
+
+    /* ── Stats row ── */
+    .stats-row {
+      display:flex; gap:20px; padding-bottom:28px; border-bottom:1px solid #e5e5e5; margin-bottom:28px;
+    }
+    .stat-col { flex:1; }
+    .stat-number { font-size:28px; font-weight:700; color:#0a1628; line-height:1.1; }
+    .stat-label  { font-size:11px; font-weight:700; color:#999; text-transform:uppercase; letter-spacing:0.4px; margin-top:4px; }
+
+    /* ── Two-column area ── */
+    .dashboard-columns { display:flex; gap:40px; }
+    .dash-left, .dash-right { flex:1; }
+
+    /* ── Section heading ── */
+    .section-heading {
+      font-size:13px; font-weight:700; color:#1a5fa0; text-transform:uppercase;
+      letter-spacing:0.3px; margin-bottom:12px; padding-bottom:6px; border-bottom:0.5px solid #e5e5e5;
+    }
+
+    /* ── Info block ── */
+    .info-block { margin-bottom:16px; }
+    .info-label { font-size:10px; font-weight:700; color:#999; text-transform:uppercase; letter-spacing:0.4px; margin-bottom:3px; }
+    .info-value { font-size:12px; color:#0a1628; line-height:1.5; }
+
+    /* ── Risk section ── */
+    .risk-section { margin-top:20px; }
+
+    /* ── Risk badge ── */
+    .risk-badge {
+      display:inline-block; font-size:10px; font-weight:700; text-transform:uppercase;
+      letter-spacing:0.4px; padding:2px 8px; border-radius:2px; margin-left:6px; vertical-align:middle;
+    }
+    .risk-high   { background:#fce5e5; color:#a73a3a; }
+    .risk-medium { background:#fef5e5; color:#b37a00; }
+    .risk-low    { background:#e8f5e9; color:#2e7d32; }
+
+    /* ── Asset list ── */
+    .asset-item {
+      font-family:"Courier New",Courier,monospace; font-size:11px; color:#666;
+      padding:6px 0; border-bottom:0.5px solid #e5e5e5; line-height:1.4;
+    }
+    .asset-item:last-child { border-bottom:none; }
+    .assets-more { font-size:11px; color:#1a5fa0; font-weight:700; margin-top:6px; display:block; }
+
+    /* ── Footer ── */
+    .page-footer {
+      position:fixed; bottom:0; left:0; right:0;
+      padding:6px 40px; border-top:0.5px solid #e5e5e5;
+      text-align:right; font-size:10px; color:#999; background:#fff;
+    }
+  </style>
+</head>
+<body>
+
+{% set tlp_raw = report_marking | upper if report_marking else "TLP:CLEAR" %}
+{% if "RED"   in tlp_raw %}{% set tlp_class = "tlp-red"   %}{% set tlp_dist = "Recipients may not share this information further." %}
+{% elif "AMBER" in tlp_raw %}{% set tlp_class = "tlp-amber" %}{% set tlp_dist = "Recipients may share within their organization." %}
+{% elif "GREEN" in tlp_raw %}{% set tlp_class = "tlp-green" %}{% set tlp_dist = "Recipients may share within their community." %}
+{% else %}{% set tlp_class = "tlp-clear" %}{% set tlp_dist = "Unlimited distribution." %}{% endif %}
+
+<div class="tlp-header {{ tlp_class }}">
+  <span>{{ report_marking | upper if report_marking else "TLP:CLEAR" }}</span>
+  <span class="tlp-right">OpenCTI Report Export</span>
+</div>
+
+<div class="page">
+  <div class="page-title">Intelligence Summary</div>
+
+  <div class="stats-row">
+    <div class="stat-col">
+      <div class="stat-number">{{ total_iocs | default(0) }}</div>
+      <div class="stat-label">Total IOCs</div>
+    </div>
+    <div class="stat-col">
+      <div class="stat-number">{{ malware_count | default(0) }}</div>
+      <div class="stat-label">Malware Families</div>
+    </div>
+    <div class="stat-col">
+      <div class="stat-number">{{ attack_pattern_count | default(0) }}</div>
+      <div class="stat-label">Attack Patterns</div>
+    </div>
+    <div class="stat-col">
+      <div class="stat-number">{{ incident_count | default(0) }}</div>
+      <div class="stat-label">Related Incidents</div>
+    </div>
+  </div>
+
+  <div class="dashboard-columns">
+
+    <div class="dash-left">
+      <div class="section-heading">Analysis Metadata</div>
+
+      <div class="info-block">
+        <div class="info-label">Investigated By</div>
+        <div class="info-value">{{ report_creator | default("N/A") }}</div>
+      </div>
+      <div class="info-block">
+        <div class="info-label">Analysis Period</div>
+        <div class="info-value">
+          {% if analysis_start and analysis_end %}{{ analysis_start }} — {{ analysis_end }}
+          {% elif analysis_start %}From {{ analysis_start }}
+          {% else %}{{ report_date }}{% endif %}
+        </div>
+      </div>
+      <div class="info-block">
+        <div class="info-label">Report Date</div>
+        <div class="info-value">{{ report_date }}</div>
+      </div>
+      <div class="info-block">
+        <div class="info-label">Confidence Level</div>
+        <div class="info-value">{{ report_confidence | default("N/A") }} / 100</div>
+      </div>
+
+      <div class="risk-section">
+        <div class="section-heading">Risk Assessment</div>
+        <div class="info-block">
+          <div class="info-label">Overall Risk Level</div>
+          <div class="info-value">
+            {% set rl = risk_level | upper if risk_level else "N/A" %}
+            {{ rl }}
+            {% if   rl == "HIGH"   %}<span class="risk-badge risk-high">High</span>
+            {% elif rl == "MEDIUM" %}<span class="risk-badge risk-medium">Medium</span>
+            {% elif rl == "LOW"    %}<span class="risk-badge risk-low">Low</span>
+            {% endif %}
+          </div>
+        </div>
+        {% if cvss_score %}
+        <div class="info-block">
+          <div class="info-label">CVSS Score</div>
+          <div class="info-value">{{ cvss_score }}</div>
+        </div>
+        {% endif %}
+        {% if exploitability %}
+        <div class="info-block">
+          <div class="info-label">Exploitability</div>
+          <div class="info-value">{{ exploitability }}</div>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="dash-right">
+      <div class="section-heading">Impacted Assets</div>
+      {% set assets = impacted_assets | default([]) %}
+      {% if assets | length == 0 %}
+        <div class="asset-item">No assets identified.</div>
+      {% else %}
+        {% for asset in assets[:5] %}
+          <div class="asset-item">{{ asset }}</div>
+        {% endfor %}
+        {% if assets | length > 5 %}
+          <span class="assets-more">[+{{ assets | length - 5 }} more]</span>
+          {% for asset in assets[5:] %}
+            <div class="asset-item">{{ asset }}</div>
+          {% endfor %}
+        {% endif %}
+      {% endif %}
+    </div>
+
+  </div>
+</div>
+
+<div class="page-footer">
+  Page {{ current_page | default(2) }} of {{ total_pages | default("?") }}
+  &nbsp;|&nbsp;
+  Distribution: {{ report_marking | upper if report_marking else "TLP:CLEAR" }} — {{ tlp_dist }}
+</div>
+
+</body>
+</html>

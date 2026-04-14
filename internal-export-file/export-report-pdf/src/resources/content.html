@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+{#
+  content.html — Page 3+: Threat Analysis Body (two-column layout)
+  ==================================================================
+  Context variables:
+    report_name, report_marking
+    report_content_html  (markdown converted to HTML + callouts post-processed)
+    report_external_refs (list[str])
+    total_pages, current_page
+#}
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ report_name }}</title>
+  <style>
+    @font-face { font-family:"Fira Sans"; font-weight:400; src:url(firasans-regular.otf); }
+    @font-face { font-family:"Fira Sans"; font-weight:700; src:url(firasans-bold.otf); }
+    @font-face { font-family:"Fira Sans"; font-style:italic; font-weight:400; src:url(firasans-italic.otf); }
+
+    @page {
+      size:A4; margin:0;
+      @bottom-right {
+        content:"Page " counter(page) " of " counter(pages) " | Distribution: {{ report_marking | upper if report_marking else 'TLP:CLEAR' }}";
+        font-family:"Fira Sans",Arial,sans-serif; font-size:10px; color:#999;
+        padding-right:40px; vertical-align:middle;
+      }
+    }
+
+    * { box-sizing:border-box; margin:0; padding:0; }
+    html, body { font-family:"Fira Sans","Helvetica Neue",Arial,sans-serif; font-size:12px; color:#444; background:#fff; width:210mm; }
+
+    /* ── TLP header ── */
+    .tlp-header {
+      display:flex; justify-content:space-between; align-items:center;
+      width:100%; padding:8px 24px; border-bottom:0.5px solid #ddd;
+      font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.6px;
+    }
+    .tlp-red   { background:#000; color:#FF2B2B; }
+    .tlp-amber { background:#000; color:#FFC000; }
+    .tlp-green { background:#000; color:#33FF00; }
+    .tlp-clear { background:#000; color:#fff; }
+    .tlp-right { color:#999; font-size:10px; font-weight:400; letter-spacing:0.3px; text-transform:none; }
+
+    .page { padding:28px 40px 40px; }
+    .page-title { font-size:24px; font-weight:700; color:#0a1628; letter-spacing:-0.5px; margin-bottom:20px; }
+
+    /* ── Two-column body ── */
+    .report-body { column-count:2; column-gap:32px; column-fill:balance; orphans:3; widows:3; }
+
+    .report-body p  { font-size:12px; color:#444; text-align:justify; line-height:1.6; margin-bottom:12px; }
+
+    .report-body h1, .report-body h2, .report-body h3,
+    .report-body h4, .report-body h5, .report-body h6 {
+      font-size:13px; font-weight:700; color:#1a5fa0; text-transform:uppercase;
+      letter-spacing:0.3px; margin-top:16px; margin-bottom:10px; break-after:avoid;
+    }
+
+    .report-body ul, .report-body ol { font-size:12px; color:#444; line-height:1.5; margin-left:16px; margin-bottom:12px; }
+    .report-body li { margin-bottom:6px; }
+    .report-body a  { color:#1a5fa0; text-decoration:underline; }
+
+    .report-body pre {
+      font-family:"Courier New",Courier,monospace; font-size:11px;
+      background:#f5f5f5; color:#555; padding:12px; border-radius:2px;
+      line-height:1.4; margin:12px 0; white-space:pre-wrap; word-break:break-all; overflow-x:auto;
+    }
+    .report-body pre code { background:none; padding:0; font-size:inherit; }
+    .report-body code { font-family:"Courier New",Courier,monospace; font-size:11px; background:#f5f5f5; padding:2px 4px; border-radius:2px; }
+
+    .report-body table  { width:100%; font-size:12px; border-collapse:collapse; margin:12px 0; }
+    .report-body th     { background:#0a1628; color:#fff; padding:8px; text-align:left; font-weight:700; font-size:11px; }
+    .report-body td     { padding:8px; border:0.5px solid #e5e5e5; color:#444; }
+    .report-body tr:nth-child(even) td { background:#f9f9f9; }
+
+    .report-body blockquote { border-left:3px solid #1a5fa0; padding-left:12px; font-style:italic; color:#666; background:#f9f9f9; margin:12px 0; }
+    .report-body blockquote p { text-align:left; }
+
+    .report-body img { max-width:100%; height:auto; border-radius:2px; margin:12px 0; display:block; }
+
+    /* ── Callout blocks (injected by _process_callouts) ── */
+    .callout-critical { border-left:4px solid #a73a3a; background:#fce5e5; padding:12px; margin:16px 0; border-radius:2px; break-inside:avoid; }
+    .callout-critical .callout-label { font-size:10px; font-weight:700; color:#a73a3a; text-transform:uppercase; letter-spacing:0.3px; margin-bottom:6px; }
+    .callout-critical .callout-body  { font-size:11px; color:#7a2828; line-height:1.5; }
+
+    .callout-warning { border-left:4px solid #b37a00; background:#fef5e5; padding:12px; margin:16px 0; border-radius:2px; break-inside:avoid; }
+    .callout-warning .callout-label { font-size:10px; font-weight:700; color:#b37a00; text-transform:uppercase; letter-spacing:0.3px; margin-bottom:6px; }
+    .callout-warning .callout-body  { font-size:11px; color:#7a5a00; line-height:1.5; }
+
+    .callout-note { border-left:4px solid #1a5fa0; background:#e6f1fb; padding:12px; margin:16px 0; border-radius:2px; break-inside:avoid; }
+    .callout-note .callout-label { font-size:10px; font-weight:700; color:#1a5fa0; text-transform:uppercase; letter-spacing:0.3px; margin-bottom:6px; }
+    .callout-note .callout-body  { font-size:11px; color:#0a3566; line-height:1.5; }
+
+    /* ── External references ── */
+    .ext-refs { margin-top:40px; border-top:0.5px solid #e5e5e5; padding-top:16px; }
+    .ext-refs-title { font-size:13px; font-weight:700; color:#1a5fa0; text-transform:uppercase; letter-spacing:0.3px; margin-bottom:10px; }
+    .ext-refs ul  { list-style:none; padding:0; }
+    .ext-refs li  { font-size:11px; margin-bottom:6px; border-bottom:0.5px solid #e5e5e5; padding-bottom:6px; }
+    .ext-refs li:last-child { border-bottom:none; }
+    .ext-refs a   { color:#1a5fa0; text-decoration:underline; word-break:break-all; }
+  </style>
+</head>
+<body>
+
+{% set tlp_raw = report_marking | upper if report_marking else "TLP:CLEAR" %}
+{% if "RED"   in tlp_raw %}{% set tlp_class = "tlp-red"   %}
+{% elif "AMBER" in tlp_raw %}{% set tlp_class = "tlp-amber" %}
+{% elif "GREEN" in tlp_raw %}{% set tlp_class = "tlp-green" %}
+{% else %}{% set tlp_class = "tlp-clear" %}{% endif %}
+
+<div class="tlp-header {{ tlp_class }}">
+  <span>{{ report_marking | upper if report_marking else "TLP:CLEAR" }}</span>
+  <span class="tlp-right">OpenCTI Report Export</span>
+</div>
+
+<div class="page">
+  <div class="page-title">{{ report_name }}</div>
+
+  <div class="report-body">
+    {{ report_content_html | safe }}
+  </div>
+
+  {% if report_external_refs %}
+  <div class="ext-refs">
+    <div class="ext-refs-title">External References</div>
+    <ul>
+      {% for ref in report_external_refs %}
+      <li><a href="{{ ref }}" target="_blank">{{ ref }}</a></li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+</div>
+
+</body>
+</html>
